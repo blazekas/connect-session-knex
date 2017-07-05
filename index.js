@@ -67,7 +67,7 @@ module.exports = function(connect) {
 	* @api private
 	*/
 	function isMySQL(knex) {
-		return ['mysql', 'mariasql', 'mariadb'].indexOf(knex.client.dialect) > -1;
+		return ['mysql', 'mariasql', 'mariadb', 'mssql'].indexOf(knex.client.dialect) > -1;
 	}
 
 	/*
