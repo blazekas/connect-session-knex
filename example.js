@@ -2,13 +2,13 @@ const express = require('express'); // Express 4
 const app = express();
 
 const session = require('express-session');
-const KnexSessionStore = require('./index.js')(session);
+const KnexSessionStore = require('connect-session-knex')(session);
 const store = new KnexSessionStore(/* options here */); // defaults to a sqlite3 database
 
 app.use(session({
     secret: 'keyboard cat',
     cookie: {
-        maxAge: 30000 // 2 seconds for testing
+        maxAge: 30000 // 30 seconds for testing
     },
     store: store
 }));

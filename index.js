@@ -25,7 +25,7 @@ module.exports = function(connect) {
 		if(isOracle(knex)){
 			return date;
 		}
-		return isMySQL(knex) ? date.toISOString().slice(0, 19).replace('T', ' ') : date.toISOString();
+		return isMySQL(knex) || isMSSQL(knex) ? date.toISOString().slice(0, 19).replace('T', ' ') : date.toISOString();
 	}
 
 	/*
@@ -34,7 +34,7 @@ module.exports = function(connect) {
 	* @api private
 	*/
 	function timestampTypeName(knex) {
-		return isMySQL(knex) ? 'DATETIME' : knex.client.dialect === 'postgresql' ? 'timestamp with time zone' : 'timestamp';
+		return isMySQL(knex) || isMSSQL(knex) ? 'DATETIME' : isPostgres(knex) ? 'timestamp with time zone' : 'timestamp';
 	}
 
 	/*
@@ -62,12 +62,30 @@ module.exports = function(connect) {
 	}
 
 	/*
-	* Returns true if the specified knex instance is using sqlite3.
+	* Returns true if the specified knex instance is using mysql.
 	* @return {bool}
 	* @api private
 	*/
 	function isMySQL(knex) {
-		return ['mysql', 'mariasql', 'mariadb', 'mssql'].indexOf(knex.client.dialect) > -1;
+		return ['mysql', 'mariasql', 'mariadb'].indexOf(knex.client.dialect) > -1;
+	}
+
+	/*
+	* Returns true if the specified knex instance is using mssql.
+	* @return {bool}
+	* @api private
+	*/
+	function isMSSQL(knex) {
+		return ['mssql'].indexOf(knex.client.dialect) > -1;
+	}
+
+	/*
+	* Returns true if the specified knex instance is using postgresql.
+	* @return {bool}
+	* @api private
+	*/
+	function isPostgres(knex) {
+		return ['postgresql'].indexOf(knex.client.dialect) > -1;
 	}
 
 	/*
@@ -77,6 +95,65 @@ module.exports = function(connect) {
 	*/
 	function isOracle(knex) {
 		return ['oracle', 'oracledb'].indexOf(knex.client.dialect) > -1;
+	}
+
+	/*
+	* Returns PostgreSQL fast upsert query.
+	* @return {string}
+	* @api private
+	*/
+	function getPostgresFastQuery(tablename, sidfieldname) {
+		return 'with new_values (' + sidfieldname + ', expired, sess) as (' +
+			'  values (?, ?::timestamp with time zone, ?::json)' +
+			'), ' +
+			'upsert as ' +
+			'( ' +
+			'  update ' + tablename + ' cs set ' +
+			'    ' + sidfieldname + ' = nv.' + sidfieldname + ', ' +
+			'    expired = nv.expired, ' +
+			'    sess = nv.sess ' +
+			'  from new_values nv ' +
+			'  where cs.' + sidfieldname + ' = nv.' + sidfieldname + ' ' +
+			'  returning cs.* ' +
+			')' +
+			'insert into ' + tablename + ' (' + sidfieldname + ', expired, sess) ' +
+			'select ' + sidfieldname + ', expired, sess ' +
+			'from new_values ' +
+			'where not exists (select 1 from upsert up where up.' + sidfieldname + ' = new_values.' + sidfieldname + ')';
+	}
+
+	/*
+	* Returns SQLite fast upsert query.
+	* @return {string}
+	* @api private
+	*/
+	function getSqliteFastQuery(tablename, sidfieldname) {
+		return 'insert or replace into ' + tablename + ' (' + sidfieldname + ', expired, sess) values (?, ?, ?);';
+	}
+
+	/*
+	* Returns MySQL fast upsert query.
+	* @return {string}
+	* @api private
+	*/
+	function getMysqlFastQuery(tablename, sidfieldname) {
+		return 'insert into ' + tablename + ' (' + sidfieldname + ', expired, sess) values (?, ?, ?) on duplicate key update expired=values(expired), sess=values(sess);';
+	}
+
+	/*
+	* Returns MSSQL fast upsert query.
+	* @return {string}
+	* @api private
+	*/
+	function getMssqlFastQuery(tablename, sidfieldname) {
+		return 'merge ' + tablename + ' as T ' +
+			'using (values (?, ?, ?)) as S (' + sidfieldname + ', expired, sess) ' +
+			'on (T.' + sidfieldname + ' = S.' + sidfieldname + ') ' +
+			'when matched then ' +
+			'update set expired = S.expired, sess = S.sess ' +
+			'when not matched by target then ' +
+			'insert (' + sidfieldname + ', expired, sess) values (S.' + sidfieldname + ', S.expired, S.sess) ' +
+			'output inserted.*;';
 	}
 
 	/*
@@ -96,7 +173,7 @@ module.exports = function(connect) {
 			return store.knex(store.tablename).del()
 			.whereRaw(condition, dateAsISO(store.knex));
 		}).finally(function() {
-			setTimeout(dbCleanup, interval, store, interval).unref()
+			KnexStore.nextDbCleanup = setTimeout(dbCleanup, interval, store, interval).unref();
 		});
 	}
 
@@ -133,8 +210,12 @@ module.exports = function(connect) {
 			if (!exists && self.createtable) {
 				return self.knex.schema.createTable(self.tablename, function (table) {
 					table.string(self.sidfieldname).primary();
-					table.json('sess').notNullable();
-					if (['mysql', 'mariasql'].indexOf(self.knex.client.dialect) > -1) {
+					if (isMSSQL(self.knex)) {
+						table.text('sess').notNullable();
+					} else {
+						table.json('sess').notNullable();
+					}
+					if (isMySQL(self.knex) || isMSSQL(self.knex)) {
 						table.dateTime('expired').notNullable().index();
 					} else {
 						table.timestamp('expired').notNullable().index();
@@ -180,7 +261,7 @@ module.exports = function(connect) {
 				}
 				return ret;
 			})
-			.asCallback(fn)
+			.asCallback(fn);
 		});
 	};
 
@@ -199,49 +280,34 @@ module.exports = function(connect) {
 		var now = new Date().getTime();
 		var expired = maxAge ? now + maxAge : now + oneDay;
 		sess = JSON.stringify(sess);
-		var postgresfastq = 'with new_values (' + self.sidfieldname + ', expired, sess) as (' +
-		'  values (?, ?::timestamp with time zone, ?::json)' +
-		'), ' +
-		'upsert as ' +
-		'( ' +
-		'  update ' + self.tablename + ' cs set ' +
-		'    ' + self.sidfieldname + ' = nv.' + self.sidfieldname + ', ' +
-		'    expired = nv.expired, ' +
-		'    sess = nv.sess ' +
-		'  from new_values nv ' +
-		'  where cs.' + self.sidfieldname + ' = nv.' + self.sidfieldname + ' ' +
-		'  returning cs.* ' +
-		')' +
-		'insert into ' + self.tablename + ' (' + self.sidfieldname + ', expired, sess) ' +
-		'select ' + self.sidfieldname + ', expired, sess ' +
-		'from new_values ' +
-		'where not exists (select 1 from upsert up where up.' + self.sidfieldname + ' = new_values.' + self.sidfieldname + ')';
-
-		var sqlitefastq = 'insert or replace into ' + self.tablename + ' (' + self.sidfieldname + ', expired, sess) values (?, ?, ?);';
-
-		var mysqlfastq = 'insert into ' + self.tablename + ' (' + self.sidfieldname + ', expired, sess) values (?, ?, ?) on duplicate key update expired=values(expired), sess=values(sess);';
 
 		var dbDate = dateAsISO(self.knex, expired);
 
-		if (self.knex.client.dialect === 'sqlite3') {
+		if (isSqlite3(self.knex)) {
 			// sqlite optimized query
 			return self.ready.then(function () {
-				return self.knex.raw(sqlitefastq, [sid, dbDate, sess ])
+				return self.knex.raw(getSqliteFastQuery(self.tablename, self.sidfieldname), [sid, dbDate, sess ])
 				.then(function (result) {
 					return [1];
 				})
 				.asCallback(fn);
 			});
-		} else if (self.knex.client.dialect === 'postgresql' && parseFloat(self.knex.client.version) >= 9.2) {
+		} else if (isPostgres(self.knex) && parseFloat(self.knex.client.version) >= 9.2) {
 			// postgresql optimized query
 			return self.ready.then(function () {
-				return self.knex.raw(postgresfastq, [sid, dbDate, sess ])
+				return self.knex.raw(getPostgresFastQuery(self.tablename, self.sidfieldname), [sid, dbDate, sess ])
 				.asCallback(fn);
 			});
-		} else if (['mysql', 'mariasql'].indexOf(self.knex.client.dialect) > -1) {
+		} else if (isMySQL(self.knex)) {
 			// mysql/mariaDB optimized query
 			return self.ready.then(function () {
-				return self.knex.raw(mysqlfastq, [sid, dbDate, sess ])
+				return self.knex.raw(getMysqlFastQuery(self.tablename, self.sidfieldname), [sid, dbDate, sess ])
+				.asCallback(fn);
+			});
+		} else if (isMSSQL(self.knex)) {
+			// mssql optimized query
+			return self.ready.then(function () {
+				return self.knex.raw(getMssqlFastQuery(self.tablename, self.sidfieldname), [sid, dbDate, sess ])
 				.asCallback(fn);
 			});
 		} else {
@@ -269,7 +335,7 @@ module.exports = function(connect) {
 						}
 					});
 				})
-				.asCallback(fn)
+				.asCallback(fn);
 			});
 		}
 	};
@@ -312,7 +378,7 @@ module.exports = function(connect) {
 			return self.knex.del()
 			.from(self.tablename)
 			.where(self.sidfieldname, '=', sid)
-			.asCallback(fn)
+			.asCallback(fn);
 		});
 	};
 
@@ -331,8 +397,8 @@ module.exports = function(connect) {
 			.then(function (response) {
 				return response[0].count | 0;
 			})
-			.asCallback(fn)
-		})
+			.asCallback(fn);
+		});
 	};
 
 
@@ -347,8 +413,16 @@ module.exports = function(connect) {
 		return self.ready.then(function () {
 			return self.knex.del()
 			.from(self.tablename)
-			.asCallback(fn)
+			.asCallback(fn);
 		});
+	};
+
+	/* stop the dbCleanupTimeout */
+	KnexStore.prototype.stopDbCleanup = function(){
+		if(KnexStore.nextDbCleanup){
+			clearTimeout(KnexStore.nextDbCleanup);
+			delete KnexStore.nextDbCleanup;
+		}
 	};
 
 	return KnexStore;
