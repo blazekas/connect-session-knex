@@ -157,6 +157,19 @@ module.exports = function(connect) {
 	}
 
 	/*
+	* Returns Oracle fast upsert query.
+	* @return {string}
+	* @api private
+	*/
+	function getOracleFastQuery(tablename, sidfieldname) {
+		return 'merge into "' + tablename + '" "t" ' + 
+			'using (select ? "' + sidfieldname + '", ? "expired", ? "sess" from dual) "s" ' + 
+			'on ("s"."' + sidfieldname + '" = "t"."' + sidfieldname + '") ' + 
+			'when matched then update set "t"."expired" = "s"."expired", "t"."sess" = "s"."sess" ' + 
+			'when not matched then insert ("t"."' + sidfieldname + '", "t"."expired", "t"."sess") values ("s"."' + sidfieldname + '", "s"."expired", "s"."sess")';
+	}
+
+	/*
 	* Remove expired sessions from database.
 	* @param {Object} store
 	* @param {number} interval
@@ -308,6 +321,12 @@ module.exports = function(connect) {
 			// mssql optimized query
 			return self.ready.then(function () {
 				return self.knex.raw(getMssqlFastQuery(self.tablename, self.sidfieldname), [sid, dbDate, sess ])
+				.asCallback(fn);
+			});
+		} else if (isOracle(self.knex)) {
+			// Oracle optimized query
+			return self.ready.then(function () {
+				return self.knex.raw(getOracleFastQuery(self.tablename, self.sidfieldname), [sid, dbDate, sess ])
 				.asCallback(fn);
 			});
 		} else {
