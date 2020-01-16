@@ -218,6 +218,8 @@ module.exports = function(connect) {
 			}
 		});
 
+		self.rolling = options.hasOwnProperty('rolling') ? options.rolling : true;
+
 		self.ready = self.knex.schema.hasTable(self.tablename)
 		.then(function (exists) {
 			if (!exists && self.createtable) {
@@ -369,7 +371,7 @@ module.exports = function(connect) {
 	 * @public
 	 */
 	KnexStore.prototype.touch = function(sid, sess, fn) {
-		if (sess && sess.cookie && sess.cookie.expires) {
+		if (sess && sess.cookie && sess.cookie.expires && this.rolling) {
 			var condition = expiredCondition(this.knex);
 
 			return this.knex(this.tablename)
